@@ -3,49 +3,53 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sqlite3
 import datetime
-import random
+import json
 from openai import OpenAI
 
-# --- CONFIGURE AI VIA OPENROUTER ---
-# Paste your OpenRouter API key right here inside the quotes!
+# --- CONFIGURE AI ---
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key="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"
+    api_key="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" 
 )
 
 app = FastAPI()
 
+# Standard CORS to allow React to talk to FastAPI
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class SensorData(BaseModel):
-    sensor_id: str
-    temperature: float
+DB_NAME = "chevron_final_v3.db"
+
+class SensorInput(BaseModel):
+    fluid_type: str 
+    outside_temp: float
+    humidity: float
+
+class ChatMessage(BaseModel):
+    message: str
 
 def init_db():
-    conn = sqlite3.connect("hackathon.db")
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS system_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sensor_id TEXT,
-            temperature REAL,
-            status TEXT,
-            explanation TEXT,
-            timestamp TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS maintenance_tickets (
-            ticket_id TEXT PRIMARY KEY,
-            sensor_id TEXT,
-            issue TEXT,
             timestamp TEXT,
-            status TEXT
+            fluid_type TEXT,
+            outside_temp REAL,
+            humidity REAL,
+            liquid_temp REAL,
+            ph REAL,
+            flow_rate REAL,
+            pressure REAL,
+            tank_level REAL,
+            sys_load REAL,
+            status TEXT,
+            explanation TEXT
         )
     """)
     conn.commit()
@@ -54,61 +58,47 @@ def init_db():
 init_db()
 
 @app.post("/api/sensor")
-async def process_sensor_data(data: SensorData):
-    temp = data.temperature
-    timestamp = datetime.datetime.now().strftime("%I:%M:%S %p")
+async def process_sensor_data(data: SensorInput):
+    print(f"--- Incoming Data: {data.fluid_type} | Temp: {data.outside_temp} ---")
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     
-    conn = sqlite3.connect("hackathon.db")
-    cursor = conn.cursor()
+    ai_prompt = f"Act as a Chevron Engineer. Analyze: {data.fluid_type} fluid, {data.outside_temp}C Ambient. Return ONLY JSON: {{\"liquid_temp\": float, \"ph\": float, \"flow_rate\": float, \"pressure\": float, \"level\": float, \"load\": float, \"status\": \"Normal/Warning/CRITICAL\", \"explanation\": \"Short safety report.\"}}"
     
-    # 1 & 2: DETECT AND DECIDE
-    if temp < 90:
-        status = "Normal"
-        explanation = f"System operating at optimal thermal capacity ({temp}°C)."
-    elif temp >= 90 and temp < 110:
-        status = "Warning"
-        explanation = f"Thermal elevation detected ({temp}°C). Pre-emptive monitoring engaged."
-    else:
-        status = "CRITICAL"
-        
-        # --- 4. EXPLAIN: THE AI BRAIN KICKS IN ---
-        try:
-            response = client.chat.completions.create(
-                model="openrouter/auto", # OpenRouter will automatically pick a fast model
-                messages=[
-                    {"role": "system", "content": "You are an autonomous AI safety inspector for an oilfield. Keep responses to exactly two short, professional sentences."},
-                    {"role": "user", "content": f"Pump {data.sensor_id} just reached a critical temperature of {temp}°C. Write an incident report stating the pump was remotely shut down to prevent failure and a maintenance crew was dispatched."}
-                ]
-            )
-            # This pulls the exact sentence the AI wrote
-            explanation = response.choices[0].message.content.strip()
-            
-        except Exception as e:
-            # Fallback if your Wi-Fi drops or the API key is wrong
-            explanation = f"CRITICAL OVERHEAT ({temp}°C). Autonomous shutdown engaged. Crew dispatched."
-            print("AI Error:", e)
-
-        # --- 3. ACT: Generate Maintenance Ticket ---
-        ticket_id = f"TKT-{random.randint(1000, 9999)}"
-        issue_details = f"Thermal overload ({temp}°C)."
-        cursor.execute(
-            "INSERT INTO maintenance_tickets (ticket_id, sensor_id, issue, timestamp, status) VALUES (?, ?, ?, ?, ?)",
-            (ticket_id, data.sensor_id, issue_details, timestamp, "OPEN")
+    try:
+        response = client.chat.completions.create(
+            model="openrouter/auto",
+            messages=[{"role": "user", "content": ai_prompt}]
         )
-    
-    # Save the AI's explanation to the system log
-    cursor.execute(
-        "INSERT INTO system_logs (sensor_id, temperature, status, explanation, timestamp) VALUES (?, ?, ?, ?, ?)", 
-        (data.sensor_id, temp, status, explanation, timestamp)
-    )
+        sim_data = json.loads(response.choices[0].message.content.replace('```json', '').replace('```', '').strip())
+    except Exception as e:
+        print(f"AI Error: {e}")
+        calc_pressure = 100 + (data.outside_temp * 1.5)
+        # conditionals to determine status based on temp
+        sim_data = {
+            "liquid_temp": data.outside_temp + 2.5,
+            "ph": 7.0,
+            "flow_rate": 50.0,
+            "pressure": round(calc_pressure, 2),
+            "level": 75.0,
+            "load": 30.0,
+            "status": "CRITICAL" if data.outside_temp > 45 else ("Warning" if data.outside_temp > 30 else "Normal"),
+            "explanation": f"Manual calculation: Pressure increased to {calc_pressure} PSI due to thermal expansion."
+        }
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""INSERT INTO system_logs 
+        (timestamp, fluid_type, outside_temp, humidity, liquid_temp, ph, flow_rate, pressure, tank_level, sys_load, status, explanation) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
+        (timestamp, data.fluid_type, data.outside_temp, data.humidity, 
+         sim_data['liquid_temp'], sim_data['ph'], sim_data['flow_rate'], sim_data['pressure'], 
+         sim_data['level'], sim_data['load'], sim_data['status'], sim_data['explanation']))
     conn.commit()
     conn.close()
-    
-    return {"status": status}
+    return sim_data
 
 @app.get("/api/logs")
 async def get_logs():
-    conn = sqlite3.connect("hackathon.db")
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM system_logs ORDER BY id DESC LIMIT 10")
     columns = [col[0] for col in cursor.description]
@@ -116,70 +106,85 @@ async def get_logs():
     conn.close()
     return logs
 
-@app.get("/api/tickets")
-async def get_tickets():
-    conn = sqlite3.connect("hackathon.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM maintenance_tickets ORDER BY timestamp DESC LIMIT 5")
-    columns = [col[0] for col in cursor.description]
-    tickets = [dict(zip(columns, row)) for row in cursor.fetchall()]
-    conn.close()
-    return tickets
-
-# --- NEW: AI CHATBOX ENDPOINT ---
-class ChatMessage(BaseModel):
-    message: str
-
-@app.post("/api/chat")
-async def chat_with_system(chat: ChatMessage):
-    # 1. Fetch the recent data so the AI knows what is happening
-    conn = sqlite3.connect("hackathon.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT timestamp, sensor_id, temperature, status, explanation FROM system_logs ORDER BY id DESC LIMIT 5")
-    recent_logs = cursor.fetchall()
-    conn.close()
-
-    # 2. Format the data into a hidden context string
-    context_str = "RECENT SENSOR DATA (JSON History):\n"
-    for log in recent_logs:
-        context_str += f"- [{log[0]}] {log[1]} reported {log[2]}°C. Status: {log[3]}. Action: {log[4]}\n"
-
-    # 3. Build the prompt for OpenRouter
-    prompt = f"""You are the AI Control Room Assistant for Hack Island.
-    You monitor incoming JSON sensor data and system logs. 
-    Answer the user's question briefly and professionally based ONLY on the provided recent logs below.
-    If the answer isn't in the logs, say "I don't have that data in my recent telemetry."
-
-    {context_str}
-
-    User Question: {chat.message}
-    """
-
-    try:
-        response = client.chat.completions.create(
-            model="openrouter/auto", 
-            messages=[
-                {"role": "system", "content": "You are a highly advanced AI system assistant."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        ai_reply = response.choices[0].message.content.strip()
-    except Exception as e:
-        ai_reply = "System error: Unable to connect to AI core."
-        print("Chat Error:", e)
-
-    return {"reply": ai_reply}
-
-# --- NEW: EXCEL EXPORT ENDPOINT ---
 @app.get("/api/all_logs")
 async def get_all_logs():
-    conn = sqlite3.connect("hackathon.db")
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Grab literally everything in the database
-    cursor.execute("SELECT timestamp, sensor_id, temperature, status, explanation FROM system_logs ORDER BY id DESC")
+    cursor.execute("SELECT * FROM system_logs ORDER BY id DESC")
     columns = [col[0] for col in cursor.description]
     logs = [dict(zip(columns, row)) for row in cursor.fetchall()]
     conn.close()
     return logs
 
-print("hello, world!")
+@app.post("/api/chat")
+async def chat_with_system(chat: ChatMessage):
+    try:
+        # Debug print to see if the message even arrives
+        print(f"Chat received: {chat.message}")
+
+        # Simple context fetch
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM system_logs ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+        conn.close()
+        
+        system_status = f"Current State: {row[11]} status at {row[3]}C" if row else "System is currently idle."
+
+        # AI Call
+        res = client.chat.completions.create(
+            model="openrouter/auto", 
+            messages=[
+                {"role": "system", "content": f"You are a Chevron AI Analyst. {system_status}"}, 
+                {"role": "user", "content": chat.message}
+            ]
+        )
+        return {"reply": res.choices[0].message.content}
+    except Exception as e:
+        # THIS IS KEY: Check your Python terminal to see what this prints!
+        print(f"DETAILED CHAT ERROR: {e}")
+        return {"reply": "Connection lost to Chevron Analyst."}
+    
+@app.get("/api/generate_report")
+async def generate_report():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        # Fetch all logs to analyze trends
+        cursor.execute("SELECT * FROM system_logs ORDER BY id DESC")
+        all_logs = cursor.fetchall()
+        conn.close()
+
+        if not all_logs:
+            return {"report": "No data available to generate a report."}
+
+        # Format data for the AI to "read"
+        summary_data = [f"Time: {log[1]}, Fluid: {log[2]}, Temp: {log[3]}C, Status: {log[11]}" for log in all_logs[:20]]
+        
+        report_prompt = f"""
+        Act as a Chevron Senior Operations Manager. 
+        Analyze the following recent telemetry logs and write a 'Weekly Executive Summary'.
+        
+        DATA TRENDS:
+        {json.dumps(summary_data)}
+
+        STRUCTURE:
+        1. Executive Summary (High level)
+        2. Operational Risks (Identify any temperature or pressure spikes)
+        3. Maintenance Recommendation (Suggest a next step)
+        
+        Keep it professional, concise, and industrial. Use Markdown for headers.
+        """
+
+        res = client.chat.completions.create(
+            model="openrouter/auto", 
+            messages=[{"role": "user", "content": report_prompt}]
+        )
+        return {"report": res.choices[0].message.content}
+    except Exception as e:
+        print(f"Report Error: {e}")
+        return {"report": "Failed to generate AI report. Check backend connectivity."}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
