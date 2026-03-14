@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../.venv"
+		},
+		{
+			"path": "../node_modules"
+		},
+		{
+			"path": "../public"
+		},
+		{
+			"path": "."
+		}
+	]
+}
