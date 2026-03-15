@@ -5,16 +5,16 @@ import sqlite3
 import datetime
 import json
 from openai import OpenAI
+from typing import Optional, Dict, List, Any
 
 # --- CONFIGURE AI ---
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key="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" 
+    api_key="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" 
 )
 
 app = FastAPI()
 
-# Standard CORS to allow React to talk to FastAPI
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,34 +22,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_NAME = "chevron_final_v3.db"
+DB_NAME = "chevron_final_v4.db" # Changed name to start fresh
 
 class SensorInput(BaseModel):
-    fluid_type: str 
-    outside_temp: float
+    temperature: float
     humidity: float
 
-class ChatMessage(BaseModel):
-    message: str
+class ReportRequest(BaseModel):
+    timeframe: str # "day", "week", or "month"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    # Logs Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS system_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
-            fluid_type TEXT,
-            outside_temp REAL,
+            temperature REAL,
             humidity REAL,
-            liquid_temp REAL,
-            ph REAL,
-            flow_rate REAL,
-            pressure REAL,
-            tank_level REAL,
-            sys_load REAL,
-            status TEXT,
-            explanation TEXT
+            status TEXT
+        )
+    """)
+    # Tickets Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            issue TEXT,
+            priority TEXT,
+            status TEXT
         )
     """)
     conn.commit()
@@ -57,133 +59,104 @@ def init_db():
 
 init_db()
 
-@app.post("/api/sensor")
-async def process_sensor_data(data: SensorInput):
-    print(f"--- Incoming Data: {data.fluid_type} | Temp: {data.outside_temp} ---")
-    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+@app.post("/api/arduino")
+async def receive_arduino_data(data: SensorInput):
+    """This endpoint receives live data and applies the Chevron logic"""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    ai_prompt = f"Act as a Chevron Engineer. Analyze: {data.fluid_type} fluid, {data.outside_temp}C Ambient. Return ONLY JSON: {{\"liquid_temp\": float, \"ph\": float, \"flow_rate\": float, \"pressure\": float, \"level\": float, \"load\": float, \"status\": \"Normal/Warning/CRITICAL\", \"explanation\": \"Short safety report.\"}}"
-    
-    try:
-        response = client.chat.completions.create(
-            model="openrouter/auto",
-            messages=[{"role": "user", "content": ai_prompt}]
-        )
-        sim_data = json.loads(response.choices[0].message.content.replace('```json', '').replace('```', '').strip())
-    except Exception as e:
-        print(f"AI Error: {e}")
-        calc_pressure = 100 + (data.outside_temp * 1.5)
-        # conditionals to determine status based on temp
-        sim_data = {
-            "liquid_temp": data.outside_temp + 2.5,
-            "ph": 7.0,
-            "flow_rate": 50.0,
-            "pressure": round(calc_pressure, 2),
-            "level": 75.0,
-            "load": 30.0,
-            "status": "CRITICAL" if data.outside_temp > 45 else ("Warning" if data.outside_temp > 30 else "Normal"),
-            "explanation": f"Manual calculation: Pressure increased to {calc_pressure} PSI due to thermal expansion."
-        }
+    temp = data.temperature
+    hum = data.humidity
+
+    # --- MATCHING FRONTEND LOGIC ---
+    # Temperature Logic
+    if 68 <= temp <= 78:
+        t_stat = "GREEN"
+    elif (60 <= temp < 68) or (78 < temp <= 85):
+        t_stat = "YELLOW"
+    else:
+        t_stat = "RED"
+
+    # Humidity Logic
+    if 30 <= hum <= 60:
+        h_stat = "GREEN"
+    elif (20 <= hum < 30) or (60 < hum <= 70):
+        h_stat = "YELLOW"
+    else:
+        h_stat = "RED"
+
+    # Combined Status (Worst Case)
+    if t_stat == "RED" or h_stat == "RED":
+        status = "RED"
+        priority = "High"
+        issue = f"CRITICAL: Temp {temp}F / Hum {hum}% outside safe bounds."
+    elif t_stat == "YELLOW" or h_stat == "YELLOW":
+        status = "YELLOW"
+        priority = "Medium"
+        issue = f"Warning: Environment fluctuating (T:{temp} H:{hum})"
+    else:
+        status = "GREEN"
+        priority = "Low"
+        issue = None
+
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""INSERT INTO system_logs 
-        (timestamp, fluid_type, outside_temp, humidity, liquid_temp, ph, flow_rate, pressure, tank_level, sys_load, status, explanation) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
-        (timestamp, data.fluid_type, data.outside_temp, data.humidity, 
-         sim_data['liquid_temp'], sim_data['ph'], sim_data['flow_rate'], sim_data['pressure'], 
-         sim_data['level'], sim_data['load'], sim_data['status'], sim_data['explanation']))
+    
+    # Save Log with the new status
+    cursor.execute("INSERT INTO system_logs (timestamp, temperature, humidity, status) VALUES (?, ?, ?, ?)", 
+                   (timestamp, temp, hum, status))
+    
+    # Auto-Generate Ticket if status is NOT Green
+    if issue:
+        cursor.execute("INSERT INTO tickets (timestamp, issue, priority, status) VALUES (?, ?, ?, ?)", 
+                       (timestamp, issue, priority, "Open"))
+        
     conn.commit()
     conn.close()
-    return sim_data
+    return {"message": "Data logged", "status": status}
 
-@app.get("/api/logs")
-async def get_logs():
+@app.get("/api/dashboard")
+async def get_dashboard_data():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM system_logs ORDER BY id DESC LIMIT 10")
-    columns = [col[0] for col in cursor.description]
-    logs = [dict(zip(columns, row)) for row in cursor.fetchall()]
-    conn.close()
-    return logs
-
-@app.get("/api/all_logs")
-async def get_all_logs():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM system_logs ORDER BY id DESC")
-    columns = [col[0] for col in cursor.description]
-    logs = [dict(zip(columns, row)) for row in cursor.fetchall()]
-    conn.close()
-    return logs
-
-@app.post("/api/chat")
-async def chat_with_system(chat: ChatMessage):
-    try:
-        # Debug print to see if the message even arrives
-        print(f"Chat received: {chat.message}")
-
-        # Simple context fetch
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM system_logs ORDER BY id DESC LIMIT 1")
-        row = cursor.fetchone()
-        conn.close()
-        
-        system_status = f"Current State: {row[11]} status at {row[3]}C" if row else "System is currently idle."
-
-        # AI Call
-        res = client.chat.completions.create(
-            model="openrouter/auto", 
-            messages=[
-                {"role": "system", "content": f"You are a Chevron AI Analyst. {system_status}"}, 
-                {"role": "user", "content": chat.message}
-            ]
-        )
-        return {"reply": res.choices[0].message.content}
-    except Exception as e:
-        # THIS IS KEY: Check your Python terminal to see what this prints!
-        print(f"DETAILED CHAT ERROR: {e}")
-        return {"reply": "Connection lost to Chevron Analyst."}
+    cursor.execute("SELECT * FROM system_logs ORDER BY id DESC LIMIT 1")
+    latest_log = cursor.fetchone()
     
-@app.get("/api/generate_report")
-async def generate_report():
+    cursor.execute("SELECT * FROM tickets WHERE status='Open' ORDER BY id DESC")
+    tickets = [{"id": r[0], "time": r[1], "issue": r[2], "priority": r[3]} for r in cursor.fetchall()]
+    conn.close()
+
+    if latest_log:
+        return {
+            "temperature": latest_log[2],
+            "humidity": latest_log[3],
+            "status": latest_log[4],
+            "open_tickets": tickets
+        }
+    return {"temperature": 0, "humidity": 0, "status": "Offline", "open_tickets": []}
+
+@app.post("/api/report")
+async def generate_report(req: ReportRequest):
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        # Fetch all logs to analyze trends
-        cursor.execute("SELECT * FROM system_logs ORDER BY id DESC")
-        all_logs = cursor.fetchall()
+        cursor.execute("SELECT * FROM system_logs ORDER BY id DESC LIMIT 50")
+        logs = cursor.fetchall()
+        cursor.execute("SELECT * FROM tickets ORDER BY id DESC LIMIT 20")
+        tickets = cursor.fetchall()
         conn.close()
 
-        if not all_logs:
-            return {"report": "No data available to generate a report."}
-
-        # Format data for the AI to "read"
-        summary_data = [f"Time: {log[1]}, Fluid: {log[2]}, Temp: {log[3]}C, Status: {log[11]}" for log in all_logs[:20]]
-        
-        report_prompt = f"""
-        Act as a Chevron Senior Operations Manager. 
-        Analyze the following recent telemetry logs and write a 'Weekly Executive Summary'.
-        
-        DATA TRENDS:
-        {json.dumps(summary_data)}
-
-        STRUCTURE:
-        1. Executive Summary (High level)
-        2. Operational Risks (Identify any temperature or pressure spikes)
-        3. Maintenance Recommendation (Suggest a next step)
-        
-        Keep it professional, concise, and industrial. Use Markdown for headers.
+        prompt = f"""
+        Act as a Chevron Senior Operations Manager. Write a {req.timeframe} health report for the pumping system.
+        Recent Logs count: {len(logs)}. Recent Tickets count: {len(tickets)}.
+        Format with clear headers, bullet points, and a professional tone. Focus on system health, ticket resolution, and preventative maintenance. Do not use markdown asterisks, just clean text.
         """
-
         res = client.chat.completions.create(
             model="openrouter/auto", 
-            messages=[{"role": "user", "content": report_prompt}]
+            messages=[{"role": "user", "content": prompt}]
         )
         return {"report": res.choices[0].message.content}
     except Exception as e:
-        print(f"Report Error: {e}")
-        return {"report": "Failed to generate AI report. Check backend connectivity."}
+        return {"report": f"AI Error: {e}"}
 
 if __name__ == "__main__":
     import uvicorn
